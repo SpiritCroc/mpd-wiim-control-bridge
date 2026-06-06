@@ -40,7 +40,8 @@ cargo run -- --wiim-host 192.168.1.42 --port 6602 --scheme http --poll-ms 500
 - Volume: `getvol`, `setvol`, `volume`
 - Playback mode: `repeat`, `random`, `single`
 - Outputs: `outputs`, `enableoutput`, `disableoutput`, `toggleoutput`
-- Compatibility/static: `commands`, `tagtypes`, `ping`, `close`, `playlistinfo`, `lsinfo`, `stats`, command lists
+- Playlist/presets: `playlistinfo`, `lsinfo`, `add`, `clear`
+- Compatibility/static: `commands`, `tagtypes`, `ping`, `close`, `stats`, command lists
 
 ## WiiM Mapping
 
@@ -50,5 +51,7 @@ cargo run -- --wiim-host 192.168.1.42 --port 6602 --scheme http --poll-ms 500
 - MPD `repeat` and `random` are mapped to WiiM loop modes when the combination is exact. Unsupported MPD combinations, such as random without repeat, are accepted as compatibility no-ops.
 - MPD `single` is maintained as compatibility state. `single oneshot` pauses after the observed track changes, matching the behavior of the MPRIS bridge. WiiM single-track loop mode is not used because it does not match MPD `single` semantics.
 - `getNewAudioOutputHardwareMode` and `setAudioOutputHardwareMode:<id>` expose WiiM hardware output modes as virtual MPD outputs: `1` SPDIF, `2` AUX, `3` COAX. `disableoutput` is accepted as a no-op because WiiM does not expose a disabled hardware output state.
+- `getPresetInfo` is cached and exposed through `lsinfo` as `preset:<number>` files. `add "preset:<number>"` selects one fake playlist item, `clear` removes it, and `play` starts it via `MCUKeyShortClick:<number>`.
+- `playlistinfo` returns the selected preset when one is selected, otherwise it returns the current WiiM track as a one-item compatibility playlist.
 
-Adding URLs to play is intentionally not implemented.
+Adding arbitrary URLs to play is intentionally not implemented.

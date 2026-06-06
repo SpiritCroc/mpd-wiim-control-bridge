@@ -40,6 +40,7 @@ enum Command {
     SetRandom(bool),
     SetSingle(SingleMode),
     SetOutput(OutputMode),
+    PlayPreset(u8),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,6 +111,7 @@ struct PlayerState {
     loop_state: LoopState,
     playlist_len: Option<u32>,
     song_index: Option<u32>,
+    playlist_version: u32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -121,11 +123,23 @@ struct PlayerStateForIdle {
     art_url: Option<String>,
     loop_state: LoopState,
     single: SingleMode,
+    selected_preset: Option<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Preset {
+    number: u8,
+    name: String,
+    source: Option<String>,
+    url: Option<String>,
+    art_url: Option<String>,
 }
 
 struct MpdSharedState {
     player_state: Arc<RwLock<Option<PlayerState>>>,
     output_mode: Arc<RwLock<Option<OutputMode>>>,
+    presets: Arc<RwLock<Vec<Preset>>>,
+    selected_preset: Arc<RwLock<Option<u8>>>,
     playback_options: Arc<RwLock<PlaybackOptions>>,
 }
 
@@ -207,6 +221,20 @@ struct WiimOutputModeResponse {
     hardware: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct WiimPresetResponse {
+    preset_list: Option<Vec<WiimPreset>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WiimPreset {
+    number: Option<u8>,
+    name: Option<String>,
+    source: Option<String>,
+    url: Option<String>,
+    picurl: Option<String>,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
@@ -221,6 +249,8 @@ async fn main() -> anyhow::Result<()> {
     let shared_state = Arc::new(MpdSharedState {
         player_state: Arc::new(RwLock::new(None)),
         output_mode: Arc::new(RwLock::new(None)),
+        presets: Arc::new(RwLock::new(Vec::new())),
+        selected_preset: Arc::new(RwLock::new(None)),
         playback_options: Arc::new(RwLock::new(PlaybackOptions::default())),
     });
 
@@ -326,6 +356,31 @@ impl WiimClient {
         Ok(())
     }
 
+    async fn get_presets(&self) -> anyhow::Result<Vec<Preset>> {
+        let text = self.command_text("getPresetInfo").await?;
+        if text.trim() == "Failed" {
+            return Ok(Vec::new());
+        }
+        let response: WiimPresetResponse = serde_json::from_str(&text)
+            .with_context(|| format!("Failed to parse WiiM response: {text}"))?;
+        Ok(response
+            .preset_list
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|preset| {
+                let number = preset.number?;
+                let name = preset.name.unwrap_or_else(|| format!("Preset {number}"));
+                Some(Preset {
+                    number,
+                    name,
+                    source: preset.source,
+                    url: preset.url,
+                    art_url: preset.picurl,
+                })
+            })
+            .collect())
+    }
+
     async fn send_player_cmd(&self, command: &str) -> anyhow::Result<()> {
         let response = self
             .command_text(&format!("setPlayerCmd:{command}"))
@@ -342,7 +397,11 @@ async fn observe_wiim(
     poll_delay: Duration,
 ) {
     let mut last_emitted_player_state = None;
+    let mut last_playlist_identity = None;
+    let mut playlist_version = 0u32;
     let mut last_emitted_output_mode = None;
+    let mut last_emitted_presets = Vec::new();
+    let mut preset_poll_ticks = 0u8;
     loop {
         match timeout(poll_delay, command_rx.recv()).await {
             Ok(Some(command)) => handle_wiim_command(&wiim, command, &shared_state).await,
@@ -350,13 +409,21 @@ async fn observe_wiim(
             Err(_) => trace!("Polling WiiM"),
         }
 
-        let player_state = match read_wiim_state(&wiim).await {
+        let mut player_state = match read_wiim_state(&wiim).await {
             Ok(state) => Some(state),
             Err(e) => {
                 warn!("Failed to read WiiM state: {e}");
                 None
             }
         };
+        if let Some(player_state) = player_state.as_mut() {
+            let current_identity = playlist_identity(player_state);
+            if last_playlist_identity.as_ref() != Some(&current_identity) {
+                playlist_version = playlist_version.wrapping_add(1).max(1);
+                last_playlist_identity = Some(current_identity);
+            }
+            player_state.playlist_version = playlist_version;
+        }
         if single_value(&shared_state) == SingleMode::OneShot
             && last_emitted_player_state.as_ref().map(track_identity)
                 != player_state.as_ref().map(track_identity)
@@ -389,6 +456,18 @@ async fn observe_wiim(
             output_mode,
             &mut last_emitted_output_mode,
         );
+
+        if preset_poll_ticks == 0 {
+            let presets = match wiim.get_presets().await {
+                Ok(presets) => presets,
+                Err(e) => {
+                    warn!("Failed to read WiiM presets: {e}");
+                    Vec::new()
+                }
+            };
+            try_set_presets(&shared_state.presets, presets, &mut last_emitted_presets);
+        }
+        preset_poll_ticks = (preset_poll_ticks + 1) % 30;
         if last_emitted_player_state.is_none() {
             sleep(Duration::from_millis(1500)).await;
         }
@@ -423,6 +502,10 @@ async fn handle_wiim_command(wiim: &WiimClient, command: Command, shared_state: 
         }
         Command::SetSingle(value) => set_single_mode(shared_state, value),
         Command::SetOutput(output_mode) => wiim.set_output_mode(output_mode).await,
+        Command::PlayPreset(number) => wiim
+            .command_text(&format!("MCUKeyShortClick:{number}"))
+            .await
+            .map(|_| ()),
     };
     if let Err(e) = result {
         error!("Failed to execute WiiM command: {e}");
@@ -493,6 +576,7 @@ async fn read_wiim_state(wiim: &WiimClient) -> anyhow::Result<PlayerState> {
         loop_state: parse_loop_state(status.loop_mode.as_deref()),
         playlist_len: parse_u32(status.plicount.as_deref()),
         song_index: parse_u32(status.plicurr.as_deref()),
+        playlist_version: 0,
     })
 }
 
@@ -637,7 +721,7 @@ async fn handle_mpd_query(
         b"ping" => Ok(Vec::new()),
         b"commands" => handle_commands(),
         b"tagtypes" => handle_tagtypes(),
-        b"play" => enqueue_command(state, Command::Play).await,
+        b"play" => handle_play(state, shared_state.clone()).await,
         b"pause" => handle_pause(arguments, state).await,
         b"stop" => enqueue_command(state, Command::Stop).await,
         b"next" => enqueue_command(state, Command::Next).await,
@@ -674,7 +758,11 @@ async fn handle_mpd_query(
         b"volume" => handle_volume(arguments, state).await,
         b"setvol" => handle_setvol(arguments, state).await,
         b"getvol" => handle_getvol(shared_state),
-        b"playlistinfo" | b"lsinfo" | b"stats" | b"noidle" => Ok(Vec::new()),
+        b"playlistinfo" => handle_playlist_info(shared_state),
+        b"lsinfo" => handle_lsinfo(shared_state),
+        b"add" => handle_add(arguments, shared_state),
+        b"clear" => handle_clear(shared_state),
+        b"stats" | b"noidle" => Ok(Vec::new()),
         _ => Err(anyhow::anyhow!(
             "Unknown command: {}",
             safe_command_print(command)
@@ -685,6 +773,8 @@ async fn handle_mpd_query(
 
 fn handle_commands() -> anyhow::Result<Vec<u8>> {
     Ok("command: close\n\
+         command: add\n\
+         command: clear\n\
          command: commands\n\
          command: currentsong\n\
          command: disableoutput\n\
@@ -724,6 +814,22 @@ fn handle_tagtypes() -> anyhow::Result<Vec<u8>> {
 async fn enqueue_command(state: &mut MpdQueryState, command: Command) -> anyhow::Result<Vec<u8>> {
     state.command_tx.send(command).await?;
     Ok(Vec::new())
+}
+
+async fn handle_play(
+    state: &mut MpdQueryState,
+    shared_state: Arc<MpdSharedState>,
+) -> anyhow::Result<Vec<u8>> {
+    let selected_preset = shared_state
+        .selected_preset
+        .read()
+        .ok()
+        .and_then(|selected_preset| *selected_preset);
+    if let Some(number) = selected_preset {
+        enqueue_command(state, Command::PlayPreset(number)).await
+    } else {
+        enqueue_command(state, Command::Play).await
+    }
 }
 
 async fn handle_pause(arguments: &[u8], state: &mut MpdQueryState) -> anyhow::Result<Vec<u8>> {
@@ -918,7 +1024,66 @@ fn handle_current_song(shared_state: Arc<MpdSharedState>) -> anyhow::Result<Vec<
     if let Some(art_url) = &player_state.art_url {
         response.extend_from_slice(format!("arturl: {art_url}\n").as_bytes());
     }
+    append_song_identity(&mut response, &player_state);
     Ok(response)
+}
+
+fn handle_playlist_info(shared_state: Arc<MpdSharedState>) -> anyhow::Result<Vec<u8>> {
+    if let Some(preset) = selected_preset(&shared_state) {
+        let mut response = Vec::new();
+        append_preset_song(&mut response, &preset);
+        return Ok(response);
+    }
+    handle_current_song(shared_state)
+}
+
+fn handle_lsinfo(shared_state: Arc<MpdSharedState>) -> anyhow::Result<Vec<u8>> {
+    let presets = shared_state
+        .presets
+        .read()
+        .map(|presets| presets.clone())
+        .unwrap_or_default();
+    let mut response = Vec::new();
+    for preset in presets {
+        response.extend_from_slice(format!("file: preset:{}\n", preset.number).as_bytes());
+        response.extend_from_slice(format!("Title: {}\n", preset.name).as_bytes());
+        if let Some(source) = &preset.source {
+            response.extend_from_slice(format!("Artist: {source}\n").as_bytes());
+        }
+        if let Some(art_url) = &preset.art_url {
+            response.extend_from_slice(format!("arturl: {art_url}\n").as_bytes());
+        }
+    }
+    Ok(response)
+}
+
+fn handle_add(arguments: &[u8], shared_state: Arc<MpdSharedState>) -> anyhow::Result<Vec<u8>> {
+    let argument = unquote_bytes(arguments)?;
+    let Some(number) = argument.strip_prefix("preset:") else {
+        return Err(anyhow::anyhow!("Only preset:N entries can be added"));
+    };
+    let number = number.parse::<u8>()?;
+    let presets = shared_state
+        .presets
+        .read()
+        .map_err(|_| anyhow::anyhow!("Failed to read presets"))?;
+    if !presets.iter().any(|preset| preset.number == number) {
+        return Err(anyhow::anyhow!("Unknown preset {number}"));
+    }
+    drop(presets);
+    *shared_state
+        .selected_preset
+        .write()
+        .map_err(|_| anyhow::anyhow!("Failed to write selected preset"))? = Some(number);
+    Ok(Vec::new())
+}
+
+fn handle_clear(shared_state: Arc<MpdSharedState>) -> anyhow::Result<Vec<u8>> {
+    *shared_state
+        .selected_preset
+        .write()
+        .map_err(|_| anyhow::anyhow!("Failed to write selected preset"))? = None;
+    Ok(Vec::new())
 }
 
 fn handle_status(shared_state: Arc<MpdSharedState>) -> anyhow::Result<Vec<u8>> {
@@ -929,7 +1094,7 @@ fn handle_status(shared_state: Arc<MpdSharedState>) -> anyhow::Result<Vec<u8>> {
         .and_then(|state| state.clone())
     else {
         return Ok(
-            "repeat: 0\nrandom: 0\nsingle: 0\nsong: 0\nplaylistlength: 0\nvolume: 0\nstate: stop\n"
+            "repeat: 0\nrandom: 0\nsingle: 0\nplaylist: 0\nsong: 0\nsongid: 0\nplaylistlength: 0\nvolume: 0\nstate: stop\n"
                 .into(),
         );
     };
@@ -939,16 +1104,18 @@ fn handle_status(shared_state: Arc<MpdSharedState>) -> anyhow::Result<Vec<u8>> {
         PlaybackStatus::Pause => "pause",
         PlaybackStatus::Stop | PlaybackStatus::Loading => "stop",
     };
-    let loop_state = player_state.loop_state;
+    let loop_state = &player_state.loop_state;
     let single = single_mpd_value(single_value(&shared_state));
     let volume = player_state.volume.unwrap_or(0);
     let song = player_state.song_index.unwrap_or(0);
+    let song_id = mpd_song_id(&player_state);
     let playlist_len = player_state.playlist_len.unwrap_or(1).max(1);
     let mut response = format!(
-        "repeat: {}\nrandom: {}\nsingle: {}\nsong: {song}\nplaylistlength: {playlist_len}\nvolume: {volume}\nstate: {state}\n",
+        "repeat: {}\nrandom: {}\nsingle: {}\nplaylist: {}\nsong: {song}\nsongid: {song_id}\nplaylistlength: {playlist_len}\nvolume: {volume}\nstate: {state}\n",
         bool_num(loop_state.repeat),
         bool_num(loop_state.random),
         single,
+        player_state.playlist_version,
     )
     .into_bytes();
     if let Some(duration) = player_state.duration {
@@ -999,7 +1166,10 @@ async fn handle_idle(
             }
         }
         if idle_playlist {
-            let current_state = current_raw_state.as_ref().map(get_state_for_idle_playlist);
+            let selected_preset = selected_preset_number(&shared_state);
+            let current_state = current_raw_state
+                .as_ref()
+                .map(|player_state| get_state_for_idle_playlist(player_state, selected_preset));
             if current_state != state.last_idle_playlist_state {
                 state.last_idle_playlist_state = current_state;
                 return Ok(b"changed: playlist\n".to_vec());
@@ -1081,6 +1251,71 @@ fn try_set_output_mode(
     }
 }
 
+fn try_set_presets(
+    presets: &Arc<RwLock<Vec<Preset>>>,
+    value: Vec<Preset>,
+    last_emitted_value: &mut Vec<Preset>,
+) {
+    if *last_emitted_value == value {
+        return;
+    }
+    match presets.write() {
+        Ok(mut guard) => {
+            *guard = value.clone();
+            *last_emitted_value = value;
+            trace!("Presets updated");
+        }
+        Err(_) => error!("Failed to write presets"),
+    }
+}
+
+fn selected_preset(shared_state: &MpdSharedState) -> Option<Preset> {
+    let number = shared_state
+        .selected_preset
+        .read()
+        .ok()
+        .and_then(|selected_preset| *selected_preset)?;
+    shared_state.presets.read().ok().and_then(|presets| {
+        presets
+            .iter()
+            .find(|preset| preset.number == number)
+            .cloned()
+    })
+}
+
+fn selected_preset_number(shared_state: &MpdSharedState) -> Option<u8> {
+    shared_state
+        .selected_preset
+        .read()
+        .ok()
+        .and_then(|selected_preset| *selected_preset)
+}
+
+fn append_preset_song(response: &mut Vec<u8>, preset: &Preset) {
+    response.extend_from_slice(format!("file: preset:{}\n", preset.number).as_bytes());
+    response.extend_from_slice(format!("Title: {}\n", preset.name).as_bytes());
+    if let Some(source) = &preset.source {
+        response.extend_from_slice(format!("Artist: {source}\n").as_bytes());
+    }
+    if let Some(url) = &preset.url {
+        response.extend_from_slice(format!("X-WiiM-URL: {url}\n").as_bytes());
+    }
+    if let Some(art_url) = &preset.art_url {
+        response.extend_from_slice(format!("arturl: {art_url}\n").as_bytes());
+    }
+    response.extend_from_slice(b"Pos: 0\nId: 0\n");
+}
+
+fn append_song_identity(response: &mut Vec<u8>, player_state: &PlayerState) {
+    let pos = player_state.song_index.unwrap_or(0);
+    let id = mpd_song_id(player_state);
+    response.extend_from_slice(format!("Pos: {pos}\nId: {id}\n").as_bytes());
+}
+
+fn mpd_song_id(player_state: &PlayerState) -> u32 {
+    player_state.playlist_version.max(1)
+}
+
 fn get_state_for_idle_player(player_state: &PlayerState, single: SingleMode) -> PlayerStateForIdle {
     PlayerStateForIdle {
         playback_status: player_state.playback_status,
@@ -1090,10 +1325,14 @@ fn get_state_for_idle_player(player_state: &PlayerState, single: SingleMode) -> 
         art_url: player_state.art_url.clone(),
         loop_state: player_state.loop_state.clone(),
         single,
+        selected_preset: None,
     }
 }
 
-fn get_state_for_idle_playlist(player_state: &PlayerState) -> PlayerStateForIdle {
+fn get_state_for_idle_playlist(
+    player_state: &PlayerState,
+    selected_preset: Option<u8>,
+) -> PlayerStateForIdle {
     PlayerStateForIdle {
         playback_status: PlaybackStatus::Pause,
         title: player_state.title.clone(),
@@ -1102,6 +1341,7 @@ fn get_state_for_idle_playlist(player_state: &PlayerState) -> PlayerStateForIdle
         art_url: None,
         loop_state: LoopState::default(),
         single: SingleMode::Off,
+        selected_preset,
     }
 }
 
@@ -1110,6 +1350,30 @@ fn track_identity(player_state: &PlayerState) -> (Option<String>, Option<String>
         player_state.title.clone(),
         player_state.artist.clone(),
         player_state.album.clone(),
+    )
+}
+
+fn playlist_identity(
+    player_state: &PlayerState,
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<u32>,
+    Option<u32>,
+    Option<u32>,
+) {
+    (
+        player_state.title.clone(),
+        player_state.artist.clone(),
+        player_state.album.clone(),
+        player_state.art_url.clone(),
+        player_state
+            .duration
+            .map(|duration| (duration * 1000.0).round() as u32),
+        player_state.playlist_len,
+        player_state.song_index,
     )
 }
 
