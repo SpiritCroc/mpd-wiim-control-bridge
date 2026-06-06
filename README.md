@@ -39,6 +39,7 @@ cargo run -- --wiim-host 192.168.1.42 --port 6602 --scheme http --poll-ms 500
 - Metadata/status: `currentsong`, `status`, `idle`, `noidle`
 - Volume: `getvol`, `setvol`, `volume`
 - Playback mode: `repeat`, `random`, `single`
+- Outputs: `outputs`, `enableoutput`, `disableoutput`, `toggleoutput`
 - Compatibility/static: `commands`, `tagtypes`, `ping`, `close`, `playlistinfo`, `lsinfo`, `stats`, command lists
 
 ## WiiM Mapping
@@ -48,5 +49,6 @@ cargo run -- --wiim-host 192.168.1.42 --port 6602 --scheme http --poll-ms 500
 - `setPlayerCmd:resume`, `pause`, `stop`, `next`, `prev`, `seek:<seconds>`, and `vol:<0-100>` are used for controls.
 - MPD `repeat` and `random` are mapped to WiiM loop modes when the combination is exact. Unsupported MPD combinations, such as random without repeat, are accepted as compatibility no-ops.
 - MPD `single` is maintained as compatibility state. `single oneshot` pauses after the observed track changes, matching the behavior of the MPRIS bridge. WiiM single-track loop mode is not used because it does not match MPD `single` semantics.
+- `getNewAudioOutputHardwareMode` and `setAudioOutputHardwareMode:<id>` expose WiiM hardware output modes as virtual MPD outputs: `1` SPDIF, `2` AUX, `3` COAX. `disableoutput` is accepted as a no-op because WiiM does not expose a disabled hardware output state.
 
 Adding URLs to play is intentionally not implemented.

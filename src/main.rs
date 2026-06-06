@@ -39,6 +39,7 @@ enum Command {
     SetRepeat(bool),
     SetRandom(bool),
     SetSingle(SingleMode),
+    SetOutput(OutputMode),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +68,33 @@ enum SingleMode {
 struct PlaybackOptions {
     single: SingleMode,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputMode {
+    Spdif,
+    Aux,
+    Coax,
+}
+
+impl OutputMode {
+    fn id(self) -> u8 {
+        match self {
+            OutputMode::Spdif => 1,
+            OutputMode::Aux => 2,
+            OutputMode::Coax => 3,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            OutputMode::Spdif => "SPDIF",
+            OutputMode::Aux => "AUX",
+            OutputMode::Coax => "COAX",
+        }
+    }
+}
+
+const OUTPUT_MODES: [OutputMode; 3] = [OutputMode::Spdif, OutputMode::Aux, OutputMode::Coax];
 
 #[derive(Debug, Clone, PartialEq)]
 struct PlayerState {
@@ -97,6 +125,7 @@ struct PlayerStateForIdle {
 
 struct MpdSharedState {
     player_state: Arc<RwLock<Option<PlayerState>>>,
+    output_mode: Arc<RwLock<Option<OutputMode>>>,
     playback_options: Arc<RwLock<PlaybackOptions>>,
 }
 
@@ -111,6 +140,7 @@ struct MpdQueryState {
     last_idle_player_state: Option<PlayerStateForIdle>,
     last_idle_playlist_state: Option<PlayerStateForIdle>,
     last_idle_mixer_state: Option<(Option<u8>, Option<bool>)>,
+    last_idle_output_state: Option<OutputMode>,
     should_close: bool,
 }
 
@@ -172,6 +202,11 @@ struct WiimMetaInfo {
     art_url: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct WiimOutputModeResponse {
+    hardware: Option<String>,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
@@ -185,6 +220,7 @@ async fn main() -> anyhow::Result<()> {
     let (command_tx, command_rx) = mpsc::channel(16);
     let shared_state = Arc::new(MpdSharedState {
         player_state: Arc::new(RwLock::new(None)),
+        output_mode: Arc::new(RwLock::new(None)),
         playback_options: Arc::new(RwLock::new(PlaybackOptions::default())),
     });
 
@@ -272,6 +308,24 @@ impl WiimClient {
         })
     }
 
+    async fn get_output_mode(&self) -> anyhow::Result<Option<OutputMode>> {
+        let text = self.command_text("getNewAudioOutputHardwareMode").await?;
+        if text.trim() == "Failed" {
+            return Ok(None);
+        }
+        let response: WiimOutputModeResponse = serde_json::from_str(&text)
+            .with_context(|| format!("Failed to parse WiiM response: {text}"))?;
+        Ok(response.hardware.as_deref().and_then(parse_output_mode))
+    }
+
+    async fn set_output_mode(&self, output_mode: OutputMode) -> anyhow::Result<()> {
+        let response = self
+            .command_text(&format!("setAudioOutputHardwareMode:{}", output_mode.id()))
+            .await?;
+        trace!("WiiM output mode command response: {response}");
+        Ok(())
+    }
+
     async fn send_player_cmd(&self, command: &str) -> anyhow::Result<()> {
         let response = self
             .command_text(&format!("setPlayerCmd:{command}"))
@@ -288,6 +342,7 @@ async fn observe_wiim(
     poll_delay: Duration,
 ) {
     let mut last_emitted_player_state = None;
+    let mut last_emitted_output_mode = None;
     loop {
         match timeout(poll_delay, command_rx.recv()).await {
             Ok(Some(command)) => handle_wiim_command(&wiim, command, &shared_state).await,
@@ -320,6 +375,19 @@ async fn observe_wiim(
             &shared_state.player_state,
             player_state,
             &mut last_emitted_player_state,
+        );
+
+        let output_mode = match wiim.get_output_mode().await {
+            Ok(output_mode) => output_mode,
+            Err(e) => {
+                warn!("Failed to read WiiM output mode: {e}");
+                None
+            }
+        };
+        try_set_output_mode(
+            &shared_state.output_mode,
+            output_mode,
+            &mut last_emitted_output_mode,
         );
         if last_emitted_player_state.is_none() {
             sleep(Duration::from_millis(1500)).await;
@@ -354,6 +422,7 @@ async fn handle_wiim_command(wiim: &WiimClient, command: Command, shared_state: 
             apply_loop_command(wiim, shared_state, None, Some(value)).await
         }
         Command::SetSingle(value) => set_single_mode(shared_state, value),
+        Command::SetOutput(output_mode) => wiim.set_output_mode(output_mode).await,
     };
     if let Err(e) = result {
         error!("Failed to execute WiiM command: {e}");
@@ -452,6 +521,7 @@ async fn handle_client(
         last_idle_player_state: None,
         last_idle_playlist_state: None,
         last_idle_mixer_state: None,
+        last_idle_output_state: None,
         should_close: false,
     };
 
@@ -579,6 +649,10 @@ async fn handle_mpd_query(
         b"single" => handle_single(arguments, state).await,
         b"currentsong" => handle_current_song(shared_state),
         b"status" => handle_status(shared_state),
+        b"outputs" => handle_outputs(shared_state),
+        b"enableoutput" => handle_enable_output(arguments, state).await,
+        b"disableoutput" => handle_disable_output(arguments).await,
+        b"toggleoutput" => handle_toggle_output(arguments, state, shared_state.clone()).await,
         b"idle" => handle_idle(arguments, state, shared_state, socket).await,
         b"command_list_begin" => {
             state.in_command_list = true;
@@ -611,28 +685,32 @@ async fn handle_mpd_query(
 
 fn handle_commands() -> anyhow::Result<Vec<u8>> {
     Ok("command: close\n\
-        command: commands\n\
-        command: currentsong\n\
-        command: getvol\n\
-        command: idle\n\
-        command: lsinfo\n\
-        command: next\n\
-        command: pause\n\
-        command: ping\n\
-        command: play\n\
-        command: playlistinfo\n\
-        command: previous\n\
-        command: random\n\
-        command: repeat\n\
-        command: seek\n\
-        command: seekcur\n\
-        command: setvol\n\
-        command: single\n\
-        command: stats\n\
-        command: status\n\
-        command: stop\n\
-        command: tagtypes\n\
-        command: volume\n"
+         command: commands\n\
+         command: currentsong\n\
+         command: disableoutput\n\
+         command: enableoutput\n\
+         command: getvol\n\
+         command: idle\n\
+         command: lsinfo\n\
+         command: next\n\
+         command: outputs\n\
+         command: pause\n\
+         command: ping\n\
+         command: play\n\
+         command: playlistinfo\n\
+         command: previous\n\
+         command: random\n\
+         command: repeat\n\
+         command: seek\n\
+         command: seekcur\n\
+         command: setvol\n\
+         command: single\n\
+         command: stats\n\
+         command: status\n\
+         command: stop\n\
+         command: tagtypes\n\
+         command: toggleoutput\n\
+         command: volume\n"
         .into())
 }
 
@@ -755,6 +833,58 @@ fn handle_getvol(shared_state: Arc<MpdSharedState>) -> anyhow::Result<Vec<u8>> {
     Ok(format!("volume: {volume}\n").into())
 }
 
+fn handle_outputs(shared_state: Arc<MpdSharedState>) -> anyhow::Result<Vec<u8>> {
+    let active_output = shared_state
+        .output_mode
+        .read()
+        .ok()
+        .and_then(|output_mode| *output_mode);
+    let mut response = Vec::new();
+    for output_mode in OUTPUT_MODES {
+        response.extend_from_slice(
+            format!(
+                "outputid: {}\noutputname: {}\noutputenabled: {}\n",
+                output_mode.id(),
+                output_mode.name(),
+                bool_num(active_output == Some(output_mode)),
+            )
+            .as_bytes(),
+        );
+    }
+    Ok(response)
+}
+
+async fn handle_enable_output(
+    arguments: &[u8],
+    state: &mut MpdQueryState,
+) -> anyhow::Result<Vec<u8>> {
+    let output_mode = parse_output_argument(arguments)?;
+    enqueue_command(state, Command::SetOutput(output_mode)).await
+}
+
+async fn handle_disable_output(arguments: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let _ = parse_output_argument(arguments)?;
+    Ok(Vec::new())
+}
+
+async fn handle_toggle_output(
+    arguments: &[u8],
+    state: &mut MpdQueryState,
+    shared_state: Arc<MpdSharedState>,
+) -> anyhow::Result<Vec<u8>> {
+    let output_mode = parse_output_argument(arguments)?;
+    let active_output = shared_state
+        .output_mode
+        .read()
+        .ok()
+        .and_then(|output_mode| *output_mode);
+    if active_output == Some(output_mode) {
+        Ok(Vec::new())
+    } else {
+        enqueue_command(state, Command::SetOutput(output_mode)).await
+    }
+}
+
 fn handle_current_song(shared_state: Arc<MpdSharedState>) -> anyhow::Result<Vec<u8>> {
     let Some(player_state) = shared_state
         .player_state
@@ -847,7 +977,8 @@ async fn handle_idle(
     let idle_player = idle_all || arguments.contains("player");
     let idle_playlist = idle_all || arguments.contains("playlist");
     let idle_mixer = idle_all || arguments.contains("mixer");
-    if !idle_player && !idle_playlist && !idle_mixer {
+    let idle_output = idle_all || arguments.contains("output");
+    if !idle_player && !idle_playlist && !idle_mixer && !idle_output {
         return Err(anyhow::anyhow!("No supported subsystem in {arguments}"));
     }
 
@@ -881,6 +1012,17 @@ async fn handle_idle(
             if current_state != state.last_idle_mixer_state {
                 state.last_idle_mixer_state = current_state;
                 return Ok(b"changed: mixer\n".to_vec());
+            }
+        }
+        if idle_output {
+            let current_state = shared_state
+                .output_mode
+                .read()
+                .ok()
+                .and_then(|output_mode| *output_mode);
+            if current_state != state.last_idle_output_state {
+                state.last_idle_output_state = current_state;
+                return Ok(b"changed: output\n".to_vec());
             }
         }
 
@@ -918,6 +1060,24 @@ fn try_set_player_state(
             trace!("Player state updated");
         }
         Err(_) => error!("Failed to write player state"),
+    }
+}
+
+fn try_set_output_mode(
+    output_mode: &Arc<RwLock<Option<OutputMode>>>,
+    value: Option<OutputMode>,
+    last_emitted_value: &mut Option<OutputMode>,
+) {
+    if *last_emitted_value == value {
+        return;
+    }
+    match output_mode.write() {
+        Ok(mut guard) => {
+            *guard = value;
+            *last_emitted_value = value;
+            trace!("Output mode updated");
+        }
+        Err(_) => error!("Failed to write output mode"),
     }
 }
 
@@ -981,6 +1141,20 @@ fn parse_loop_state(value: Option<&str>) -> LoopState {
             random: true,
         },
         _ => LoopState::default(),
+    }
+}
+
+fn parse_output_argument(arguments: &[u8]) -> anyhow::Result<OutputMode> {
+    let argument = unquote_bytes(arguments)?;
+    parse_output_mode(&argument).with_context(|| format!("Unsupported output id {argument}"))
+}
+
+fn parse_output_mode(value: &str) -> Option<OutputMode> {
+    match value {
+        "1" => Some(OutputMode::Spdif),
+        "2" => Some(OutputMode::Aux),
+        "3" => Some(OutputMode::Coax),
+        _ => None,
     }
 }
 
