@@ -642,7 +642,7 @@ async fn read_wiim_state(wiim: &WiimClient) -> anyhow::Result<PlayerState> {
         artist: meta.artist,
         album: meta.album,
         duration: parse_millis_as_secs(status.totlen.as_deref()).filter(|value| *value > 0.0),
-        elapsed: parse_millis_as_secs(status.curpos.as_deref()),
+        elapsed: parse_millis_as_secs(status.curpos.as_deref()).map(|value| value.max(0.0)),
         art_url: meta.art_url,
         volume: parse_u8(status.vol.as_deref()),
         mute: parse_bool_01(status.mute.as_deref()),
