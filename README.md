@@ -41,7 +41,7 @@ cargo run -- --wiim-host 192.168.1.42 --port 6602 --scheme http --poll-ms 500
 - Playback mode: `repeat`, `random`, `single`
 - Outputs: `outputs`, `enableoutput`, `disableoutput`, `toggleoutput`
 - Playlist/presets: `playlistinfo`, `lsinfo`, `add`, `clear`
-- Compatibility/static: `commands`, `tagtypes`, `ping`, `close`, `stats`, command lists
+- Compatibility/static: `commands`, `tagtypes`, `ping`, `close`, `stats`, `binarylimit`, command lists
 
 ## WiiM Mapping
 
@@ -53,5 +53,6 @@ cargo run -- --wiim-host 192.168.1.42 --port 6602 --scheme http --poll-ms 500
 - `getNewAudioOutputHardwareMode` and `setAudioOutputHardwareMode:<id>` expose WiiM hardware output modes as virtual MPD outputs: `1` SPDIF, `2` AUX, `3` COAX. `disableoutput` is accepted as a no-op because WiiM does not expose a disabled hardware output state.
 - `getPresetInfo` is cached and exposed through `lsinfo` as `preset:<number>` files. `add "preset:<number>"` selects one fake playlist item, `clear` removes it, and `play` starts it via `MCUKeyShortClick:<number>`.
 - `playlistinfo` returns the selected preset when one is selected, otherwise it returns the current WiiM track as a one-item compatibility playlist.
+- `binarylimit` is accepted for MPD client compatibility, but binary artwork commands are not implemented.
 
 Adding arbitrary URLs to play is intentionally not implemented.

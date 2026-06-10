@@ -96,6 +96,7 @@ impl OutputMode {
 }
 
 const OUTPUT_MODES: [OutputMode; 3] = [OutputMode::Spdif, OutputMode::Aux, OutputMode::Coax];
+const WIIM_READ_FAILURE_CLEAR_THRESHOLD: u32 = 5;
 
 #[derive(Debug, Clone, PartialEq)]
 struct PlayerState {
@@ -401,6 +402,9 @@ async fn observe_wiim(
     let mut playlist_version = 0u32;
     let mut last_emitted_output_mode = None;
     let mut last_emitted_presets = Vec::new();
+    let mut player_state_failures = 0u32;
+    let mut output_mode_failures = 0u32;
+    let mut preset_failures = 0u32;
     let mut preset_poll_ticks = 0u8;
     loop {
         match timeout(poll_delay, command_rx.recv()).await {
@@ -410,10 +414,33 @@ async fn observe_wiim(
         }
 
         let mut player_state = match read_wiim_state(&wiim).await {
-            Ok(state) => Some(state),
+            Ok(state) => {
+                if player_state_failures > 0 {
+                    info!(
+                        "Recovered reading WiiM state after {player_state_failures} failed polls"
+                    );
+                    player_state_failures = 0;
+                }
+                Some(state)
+            }
             Err(e) => {
-                warn!("Failed to read WiiM state: {e}");
-                None
+                player_state_failures += 1;
+                if player_state_failures == 1 {
+                    warn!("Failed to read WiiM state, keeping last known state: {e}");
+                } else if player_state_failures == WIIM_READ_FAILURE_CLEAR_THRESHOLD {
+                    warn!(
+                        "Failed to read WiiM state {player_state_failures} consecutive times, clearing state: {e}"
+                    );
+                } else {
+                    debug!(
+                        "Failed to read WiiM state ({player_state_failures} consecutive failures): {e}"
+                    );
+                }
+                if player_state_failures >= WIIM_READ_FAILURE_CLEAR_THRESHOLD {
+                    None
+                } else {
+                    last_emitted_player_state.clone()
+                }
             }
         };
         if let Some(player_state) = player_state.as_mut() {
@@ -445,10 +472,33 @@ async fn observe_wiim(
         );
 
         let output_mode = match wiim.get_output_mode().await {
-            Ok(output_mode) => output_mode,
+            Ok(output_mode) => {
+                if output_mode_failures > 0 {
+                    info!(
+                        "Recovered reading WiiM output mode after {output_mode_failures} failed polls"
+                    );
+                    output_mode_failures = 0;
+                }
+                output_mode
+            }
             Err(e) => {
-                warn!("Failed to read WiiM output mode: {e}");
-                None
+                output_mode_failures += 1;
+                if output_mode_failures == 1 {
+                    warn!("Failed to read WiiM output mode, keeping last known output mode: {e}");
+                } else if output_mode_failures == WIIM_READ_FAILURE_CLEAR_THRESHOLD {
+                    warn!(
+                        "Failed to read WiiM output mode {output_mode_failures} consecutive times, clearing output mode: {e}"
+                    );
+                } else {
+                    debug!(
+                        "Failed to read WiiM output mode ({output_mode_failures} consecutive failures): {e}"
+                    );
+                }
+                if output_mode_failures >= WIIM_READ_FAILURE_CLEAR_THRESHOLD {
+                    None
+                } else {
+                    last_emitted_output_mode
+                }
             }
         };
         try_set_output_mode(
@@ -459,10 +509,33 @@ async fn observe_wiim(
 
         if preset_poll_ticks == 0 {
             let presets = match wiim.get_presets().await {
-                Ok(presets) => presets,
+                Ok(presets) => {
+                    if preset_failures > 0 {
+                        info!(
+                            "Recovered reading WiiM presets after {preset_failures} failed polls"
+                        );
+                        preset_failures = 0;
+                    }
+                    presets
+                }
                 Err(e) => {
-                    warn!("Failed to read WiiM presets: {e}");
-                    Vec::new()
+                    preset_failures += 1;
+                    if preset_failures == 1 {
+                        warn!("Failed to read WiiM presets, keeping last known presets: {e}");
+                    } else if preset_failures == WIIM_READ_FAILURE_CLEAR_THRESHOLD {
+                        warn!(
+                            "Failed to read WiiM presets {preset_failures} consecutive times, clearing presets: {e}"
+                        );
+                    } else {
+                        debug!(
+                            "Failed to read WiiM presets ({preset_failures} consecutive failures): {e}"
+                        );
+                    }
+                    if preset_failures >= WIIM_READ_FAILURE_CLEAR_THRESHOLD {
+                        Vec::new()
+                    } else {
+                        last_emitted_presets.clone()
+                    }
                 }
             };
             try_set_presets(&shared_state.presets, presets, &mut last_emitted_presets);
@@ -719,6 +792,7 @@ async fn handle_mpd_query(
     }
     let result = match command {
         b"ping" => Ok(Vec::new()),
+        b"binarylimit" => handle_binarylimit(arguments),
         b"commands" => handle_commands(),
         b"tagtypes" => handle_tagtypes(),
         b"play" => handle_play(state, shared_state.clone()).await,
@@ -772,7 +846,8 @@ async fn handle_mpd_query(
 }
 
 fn handle_commands() -> anyhow::Result<Vec<u8>> {
-    Ok("command: close\n\
+    Ok("command: binarylimit\n\
+         command: close\n\
          command: add\n\
          command: clear\n\
          command: commands\n\
@@ -802,6 +877,11 @@ fn handle_commands() -> anyhow::Result<Vec<u8>> {
          command: toggleoutput\n\
          command: volume\n"
         .into())
+}
+
+fn handle_binarylimit(arguments: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let _ = unquote_bytes(arguments)?.parse::<usize>()?;
+    Ok(Vec::new())
 }
 
 fn handle_tagtypes() -> anyhow::Result<Vec<u8>> {
